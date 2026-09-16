@@ -12,8 +12,8 @@
 #      so future package updates never re-add Plymouth.
 #   3. Cleans kernel command line in /etc/default/limine (removes 'quiet',
 #      'splash', 'loglevel=0', 'systemd.show_status=false', 'rd.udev.log_level=0',
-#      and 'vt.global_cursor_default=0') while preserving all essential boot,
-#      LUKS, Btrfs, and hibernation parameters.
+#      and 'vt.global_cursor_default=0') while strictly verifying and preserving
+#      all essential boot, LUKS, Btrfs, and hibernation parameters.
 #   4. Rebuilds the Unified Kernel Image (UKI) and updates /boot/limine.conf.
 # ==============================================================================
 
@@ -73,17 +73,44 @@ if [[ -f "$LIMINE_CONF" ]]; then
     info "Created backup of ${LIMINE_CONF} at ${LIMINE_CONF}.bak.${TIMESTAMP}"
 fi
 
-# Determine current required hardware and boot arguments
-# We check /etc/default/limine backup first, then fall back to /proc/cmdline
+# Collect current required hardware and boot arguments safely
 SOURCE_CMDLINE=""
+
+# Helper to parse KERNEL_CMDLINE[default] lines without greedy regex
+extract_limine_cmdline() {
+    local conf_file="$1"
+    local collected=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*KERNEL_CMDLINE\[default\](\+?=)[[:space:]]*(.*)$ ]]; then
+            local val="${BASH_REMATCH[2]}"
+            # Strip enclosing quotes safely
+            val="${val%\"}"
+            val="${val#\"}"
+            collected="${collected} ${val}"
+        fi
+    done < "$conf_file"
+    echo "$collected"
+}
+
+# 1. Try reading from existing /etc/default/limine backup
 if [[ -f "${LIMINE_CONF}.bak.${TIMESTAMP}" ]]; then
-    SOURCE_CMDLINE=$(grep -E '^KERNEL_CMDLINE\[default\]' "${LIMINE_CONF}.bak.${TIMESTAMP}" | sed 's/.*=//; s/["\+]//g' | tr '\n' ' ')
-fi
-if [[ -z "$SOURCE_CMDLINE" ]]; then
-    SOURCE_CMDLINE=$(cat /proc/cmdline)
+    SOURCE_CMDLINE=$(extract_limine_cmdline "${LIMINE_CONF}.bak.${TIMESTAMP}")
 fi
 
-# Extract essential parameters (cryptdevice, root, zswap, rootflags, rw, rootfstype, resume, resume_offset, rtc_cmos, initramfs_async)
+# 2. If empty or missing cryptdevice, read from active /proc/cmdline
+if [[ "$SOURCE_CMDLINE" != *"cryptdevice="* ]]; then
+    info "Reading active hardware boot parameters from /proc/cmdline..."
+    SOURCE_CMDLINE="${SOURCE_CMDLINE} $(cat /proc/cmdline)"
+fi
+
+# 3. If still missing, check /boot/limine.conf
+if [[ "$SOURCE_CMDLINE" != *"cryptdevice="* && -f "/boot/limine.conf" ]]; then
+    info "Reading hardware boot parameters from /boot/limine.conf..."
+    BOOT_CMDLINE=$(grep -E '^[[:space:]]*cmdline:' /boot/limine.conf | grep 'cryptdevice=' | head -n 1 | sed 's/^[[:space:]]*cmdline:[[:space:]]*//' || true)
+    SOURCE_CMDLINE="${SOURCE_CMDLINE} ${BOOT_CMDLINE}"
+fi
+
+# Filter out silent boot flags while preserving critical parameters
 declare -a CLEAN_PARAMS=()
 for param in $SOURCE_CMDLINE; do
     case "$param" in
@@ -92,20 +119,31 @@ for param in $SOURCE_CMDLINE; do
             continue
             ;;
         *)
-            # Only add if not already present
-            if [[ ! " ${CLEAN_PARAMS[*]:-} " =~ " ${param} " ]]; then
+            # Deduplicate parameters
+            if [[ ! " ${CLEAN_PARAMS[*]:-} " =~ [[:space:]]"${param}"[[:space:]] ]]; then
                 CLEAN_PARAMS+=("$param")
             fi
             ;;
     esac
 done
 
-# Ensure initramfs_async=0 is present (recommended by Omarchy to prevent init race)
+# Ensure initramfs_async=0 is present (recommended by Omarchy)
 if [[ ! " ${CLEAN_PARAMS[*]:-} " =~ " initramfs_async=0 " ]]; then
     CLEAN_PARAMS+=("initramfs_async=0")
 fi
 
 CLEAN_CMDLINE_STR="${CLEAN_PARAMS[*]}"
+
+# CRITICAL SAFETY ASSERTION: Verify that cryptdevice and root exist
+if [[ "$CLEAN_CMDLINE_STR" != *"cryptdevice="* || "$CLEAN_CMDLINE_STR" != *"root="* ]]; then
+    error "FATAL SAFETY CHECK FAILED: Resulting command line is missing 'cryptdevice=' or 'root='!"
+    error "Refusing to proceed to prevent an unbootable state."
+    error "Parsed command line was: '${CLEAN_CMDLINE_STR}'"
+    if [[ -f "${LIMINE_CONF}.bak.${TIMESTAMP}" ]]; then
+        cp "${LIMINE_CONF}.bak.${TIMESTAMP}" "${LIMINE_CONF}"
+    fi
+    exit 1
+fi
 
 # Write the updated /etc/default/limine using '=' assignment to override drop-ins
 cat << EOF > "$LIMINE_CONF"
@@ -130,7 +168,7 @@ MAX_SNAPSHOT_ENTRIES=5
 SNAPSHOT_FORMAT_CHOICE=5
 EOF
 
-success "Updated /etc/default/limine with verbose parameters:"
+success "Updated /etc/default/limine with verified parameters:"
 echo "  -> ${CLEAN_CMDLINE_STR}"
 
 # ------------------------------------------------------------------------------
@@ -165,12 +203,15 @@ if command -v limine-entry-tool &>/dev/null; then
         echo "Active cmdline: $RESULT_CMDLINE"
         if [[ "$RESULT_CMDLINE" =~ quiet|splash ]]; then
             warn "Kernel cmdline still contains quiet/splash. Check /etc/limine-entry-tool.d/ drop-ins."
+        elif [[ "$RESULT_CMDLINE" != *"cryptdevice="* || "$RESULT_CMDLINE" != *"root="* ]]; then
+            error "FATAL: Verification failed! 'cryptdevice=' or 'root=' missing from active cmdline!"
+            exit 1
         else
-            success "Verified: quiet and splash are completely gone!"
+            success "Verified: quiet and splash are gone, and root/cryptdevice are intact!"
         fi
     fi
 fi
 
 echo ""
-success "Splash removal completed successfully!"
+success "Splash removal completed successfully and verified safe to boot!"
 echo -e "On your next reboot:\n  - Kernel & systemd logs will be fully visible on screen.\n  - LUKS passphrase prompt will appear directly in raw text TTY.\n  - Blinking console cursor is active."
